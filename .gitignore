@@ -1,0 +1,5 @@
+credentials.json
+token.json
+optimizer.log
+__pycache__/
+*.pyc
