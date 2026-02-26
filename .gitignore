@@ -1,5 +1,7 @@
 credentials.json
 token.json
+test_token.json
 optimizer.log
 __pycache__/
 *.pyc
+.swp
