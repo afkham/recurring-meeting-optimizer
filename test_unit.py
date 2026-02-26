@@ -117,6 +117,26 @@ class TestHasTopicsForToday(unittest.TestCase):
         ]
         self.assertFalse(self._call(content))
 
+    def test_ut13_date_heading_found_no_topics_section_cancels(self):
+        """UT-13: Today's date heading present but NO Topics section at all → False (cancel)."""
+        content = [
+            SECTION_BREAK,
+            _heading(DATE_HEADING),        # today's date heading IS present
+            _para('Attendees: Alice, Bob'),
+            _para(''),
+            _para('Notes'),                # no Topics section anywhere
+            _para(''),
+            _para('Action items'),
+        ]
+        with self.assertLogs('docs_service', level='INFO') as log_ctx:
+            result = self._call(content)
+
+        self.assertFalse(result, "Meeting should be cancelled when Topics section is absent")
+        self.assertTrue(
+            any('no Topics section' in msg for msg in log_ctx.output),
+            "Expected an INFO log mentioning 'no Topics section'",
+        )
+
     def test_ut04_topic_variants_all_recognised(self):
         """UT-04: 'Topic', 'Topic:', 'Topics', 'Topics:', 'TOPICS:' all match."""
         variants = ['Topic', 'Topic:', 'Topics', 'Topics:', 'TOPICS:']

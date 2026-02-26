@@ -244,5 +244,16 @@ def has_topics_for_today(content: list, today: datetime.date) -> bool:
                 logger.debug("Found topic content.")
                 return True
 
-    # Exhausted document without confirming topics.
+    # Document exhausted — report why no topics were confirmed.
+    if state == STATE_SEARCHING_DATE:
+        logger.debug("Today's date heading not found in document.")
+    elif state == STATE_SEARCHING_TOPICS:
+        # Today's date heading WAS found, but there was no Topics section beneath
+        # it before the document ended.  Treat as no topics → cancel.
+        logger.info(
+            "Today's date heading found but no Topics section present — "
+            "treating as no topics."
+        )
+    elif state == STATE_CHECKING_CONTENT:
+        logger.debug("Topics section found but contained no content items.")
     return False
