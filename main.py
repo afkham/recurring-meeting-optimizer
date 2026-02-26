@@ -66,9 +66,15 @@ def main() -> None:
             logger.info("No recurring meetings today — nothing to do.")
         else:
             for event in events:
-                canceller.process_event(
-                    event, calendar_svc, docs_svc, today, dry_run=args.dry_run
-                )
+                try:
+                    canceller.process_event(
+                        event, calendar_svc, docs_svc, today, dry_run=args.dry_run
+                    )
+                except Exception:
+                    logger.exception(
+                        "Error processing event '%s' — skipping and continuing.",
+                        event.get('summary', 'Untitled'),
+                    )
 
     except FileNotFoundError as exc:
         logger.error("%s", exc)
