@@ -15,6 +15,7 @@
 import datetime
 import logging
 
+import httplib2
 from googleapiclient.errors import HttpError
 
 import calendar_service
@@ -56,10 +57,10 @@ def should_cancel_event(event: dict, docs_svc, today: datetime.date) -> tuple:
         try:
             content = docs_service.fetch_doc_content(docs_svc, doc_id)
             any_doc_read = True
-        except HttpError as exc:
+        except (HttpError, httplib2.HttpLib2Error, OSError) as exc:
             logger.error(
-                "Could not read doc for event %s: %s — skipping this doc.",
-                summary, exc,
+                "Could not read doc for event %s: %s (%s) — skipping this doc.",
+                summary, exc, type(exc).__name__,
             )
             continue
 

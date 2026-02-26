@@ -15,9 +15,10 @@
 import logging
 import os
 import stat
+import tempfile
 
 import httplib2
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_httplib2 import AuthorizedHttp
@@ -62,6 +63,25 @@ def _validate_token_scopes(creds: Credentials) -> bool:
     return set(SCOPES).issubset(set(creds.scopes))
 
 
+def _save_token(creds: Credentials) -> None:
+    """Write credentials to TOKEN_PATH atomically and restrict permissions."""
+    token_dir = os.path.dirname(os.path.abspath(TOKEN_PATH))
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=token_dir, suffix='.tmp')
+    try:
+        with os.fdopen(tmp_fd, 'w') as f:
+            f.write(creds.to_json())
+        _restrict_file_permissions(tmp_path)
+        os.replace(tmp_path, TOKEN_PATH)  # atomic on POSIX
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    _restrict_file_permissions(TOKEN_PATH)
+    logger.info("Credentials saved to '%s'.", TOKEN_PATH)
+
+
 def get_credentials() -> Credentials:
     """Load OAuth2 credentials, refreshing or re-authorizing as needed."""
     if not os.path.exists(CREDENTIALS_PATH):
@@ -77,11 +97,24 @@ def get_credentials() -> Credentials:
 
     creds = None
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-        if not _validate_token_scopes(creds):
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+            if not _validate_token_scopes(creds):
+                logger.warning(
+                    "Cached token is missing required scopes — re-authenticating."
+                )
+                creds = None
+        except (ValueError, KeyError) as exc:
+            # token.json is corrupt (e.g. truncated write).  Delete it and
+            # trigger a fresh browser flow rather than crashing the run.
             logger.warning(
-                "Cached token is missing required scopes — re-authenticating."
+                "Token file '%s' is unreadable (%s) — re-authenticating.",
+                TOKEN_PATH, exc,
             )
+            try:
+                os.unlink(TOKEN_PATH)
+            except OSError:
+                pass
             creds = None
 
     if creds and creds.valid:
@@ -96,18 +129,18 @@ def get_credentials() -> Credentials:
                 "Refresh token is invalid or revoked. Re-authenticating via browser."
             )
             creds = None
+        except TransportError as exc:
+            # Network was unreachable during token refresh.  Re-raise so the
+            # caller's fatal-error handler can surface a clear message.
+            logger.error("Network error during token refresh: %s", exc)
+            raise
 
     if not creds:
         flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
         creds = flow.run_local_server(port=0)
         logger.info("Browser authentication completed.")
 
-    with open(TOKEN_PATH, 'w') as f:
-        f.write(creds.to_json())
-    # Restrict token.json to owner-read/write immediately after writing.
-    _restrict_file_permissions(TOKEN_PATH)
-    logger.info("Credentials saved to '%s'.", TOKEN_PATH)
-
+    _save_token(creds)
     return creds
 
 

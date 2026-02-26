@@ -16,6 +16,7 @@ import datetime
 import logging
 import re
 
+import httplib2
 from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
@@ -25,8 +26,11 @@ _DOC_ID_PATTERN = re.compile(r'/document/d/([a-zA-Z0-9_-]+)')
 
 # Sanity limits on attachment URL and doc ID length to reject obviously
 # malformed or adversarially crafted values before passing them to the API.
-_MAX_URL_LENGTH   = 2048
+_MAX_URL_LENGTH    = 2048
 _MAX_DOC_ID_LENGTH = 128
+
+# Number of times to retry a failed API call before giving up.
+_MAX_API_RETRIES = 5
 
 # Hard cap on the number of content elements processed per document.  A
 # normal meeting-notes doc has tens to low hundreds of elements; this prevents
@@ -92,7 +96,9 @@ def extract_doc_ids_from_event(event: dict) -> list:
 
 def fetch_doc_content(docs_svc, doc_id: str) -> list:
     """Fetch a Google Doc and return its body content list."""
-    doc = docs_svc.documents().get(documentId=doc_id).execute()
+    doc = docs_svc.documents().get(documentId=doc_id).execute(
+        num_retries=_MAX_API_RETRIES
+    )
 
     if not isinstance(doc, dict):
         logger.error("Unexpected response type from Docs API for doc '%s'.", doc_id)

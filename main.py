@@ -30,7 +30,7 @@ import logging.handlers
 import os
 import stat
 import sys
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import auth
 import calendar_service
@@ -44,29 +44,33 @@ _LOG_BACKUP_COUNT = 5
 
 def configure_logging() -> None:
     fmt = '%(asctime)s %(levelname)-8s %(name)s: %(message)s'
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    file_log_error: OSError | None = None
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=_LOG_MAX_BYTES,
-        backupCount=_LOG_BACKUP_COUNT,
-        encoding='utf-8',
-    )
-    # Restrict log file to owner-read/write after creation.
     try:
-        os.chmod(LOG_FILE, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass  # File may not exist yet on very first run; handler creates it next.
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding='utf-8',
+        )
+        handlers.append(file_handler)
+    except OSError as exc:
+        # Log file is inaccessible (disk full, permissions, missing dir, etc.).
+        # Configure stdout-only so the program can still run and the warning
+        # is visible rather than producing a bare Python traceback.
+        file_log_error = exc
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            file_handler,
-        ],
-    )
+    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 
-    # Restrict log file again now that basicConfig/handler has created it.
+    if file_log_error:
+        logging.getLogger(__name__).warning(
+            "Could not open log file '%s': %s — logging to stdout only.",
+            LOG_FILE, file_log_error,
+        )
+        return
+
+    # Restrict log file to owner-read/write.
     try:
         os.chmod(LOG_FILE, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
@@ -105,7 +109,13 @@ def main() -> None:
         tz_string = calendar_service.get_user_timezone(calendar_svc)
         logger.info("User timezone: %s", tz_string)
 
-        today = datetime.datetime.now(ZoneInfo(tz_string)).date()
+        try:
+            today = datetime.datetime.now(ZoneInfo(tz_string)).date()
+        except ZoneInfoNotFoundError:
+            logger.warning(
+                "Unknown timezone '%s' from Calendar API; falling back to UTC.", tz_string
+            )
+            today = datetime.datetime.now(ZoneInfo('UTC')).date()
         logger.info("Checking meetings for: %s", today)
 
         events = calendar_service.get_todays_recurring_events(calendar_svc, today, tz_string)
