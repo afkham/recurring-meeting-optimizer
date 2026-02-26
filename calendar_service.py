@@ -18,6 +18,17 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on the number of pagination pages fetched per run.  A typical
+# calendar has far fewer than 100 events in a single day; this prevents an
+# unbounded loop if the API unexpectedly keeps returning page tokens.
+_MAX_PAGES = 100
+
+
+def _safe_summary(event: dict) -> str:
+    """Return a sanitised event summary safe to write to logs."""
+    raw = event.get('summary', 'Untitled')
+    return repr(raw[:80])
+
 
 def get_user_timezone(calendar_svc) -> str:
     """Return the user's calendar timezone string (e.g. 'America/New_York')."""
@@ -33,8 +44,17 @@ def get_todays_recurring_events(calendar_svc, today: datetime.date, tz: str) -> 
 
     events = []
     page_token = None
+    pages_fetched = 0
 
     while True:
+        if pages_fetched >= _MAX_PAGES:
+            logger.warning(
+                "Pagination limit (%d pages) reached while fetching today's events — "
+                "some events may have been skipped.",
+                _MAX_PAGES,
+            )
+            break
+
         response = calendar_svc.events().list(
             calendarId='primary',
             timeMin=time_min,
@@ -43,6 +63,7 @@ def get_todays_recurring_events(calendar_svc, today: datetime.date, tz: str) -> 
             orderBy='startTime',
             pageToken=page_token,
         ).execute()
+        pages_fetched += 1
 
         for event in response.get('items', []):
             # Only recurring instances (they have recurringEventId), that are not cancelled,
@@ -65,7 +86,7 @@ def get_todays_recurring_events(calendar_svc, today: datetime.date, tz: str) -> 
 def cancel_event_occurrence(calendar_svc, event: dict, note: str) -> None:
     """Prepend cancellation note to event description, then delete the occurrence for all attendees."""
     event_id = event['id']
-    summary = event.get('summary', 'Untitled')
+    summary  = _safe_summary(event)
 
     # Prepend the note to the existing description so attendees see the reason.
     existing_desc = event.get('description', '') or ''
@@ -83,4 +104,4 @@ def cancel_event_occurrence(calendar_svc, event: dict, note: str) -> None:
         sendUpdates='all',
     ).execute()
 
-    logger.info("Cancelled occurrence of '%s' (id=%s).", summary, event_id)
+    logger.info("Cancelled occurrence of %s (id=%s).", summary, event_id)

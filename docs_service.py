@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 _DOC_MIME_TYPE = 'application/vnd.google-apps.document'
 _DOC_ID_PATTERN = re.compile(r'/document/d/([a-zA-Z0-9_-]+)')
 
+# Sanity limits on attachment URL and doc ID length to reject obviously
+# malformed or adversarially crafted values before passing them to the API.
+_MAX_URL_LENGTH   = 2048
+_MAX_DOC_ID_LENGTH = 128
+
+# Hard cap on the number of content elements processed per document.  A
+# normal meeting-notes doc has tens to low hundreds of elements; this prevents
+# a pathologically large document from consuming excessive CPU/memory.
+_MAX_CONTENT_ELEMENTS = 10_000
+
 # Matches the date prefix in a heading, e.g. "Feb 25, 2026"
 _DATE_PREFIX_RE = re.compile(r'^[A-Z][a-z]{2} \d{1,2}, \d{4}')
 
@@ -36,14 +46,14 @@ _END_SECTION_NAMES = frozenset({
 # Map namedStyleType to a numeric level for hierarchy comparisons.
 # Lower number = higher in the document hierarchy.
 _HEADING_LEVELS = {
-    'TITLE': 0,
-    'HEADING_1': 1,
-    'HEADING_2': 2,
-    'HEADING_3': 3,
-    'HEADING_4': 4,
-    'HEADING_5': 5,
-    'HEADING_6': 6,
-    'SUBTITLE': 7,
+    'TITLE':       0,
+    'HEADING_1':   1,
+    'HEADING_2':   2,
+    'HEADING_3':   3,
+    'HEADING_4':   4,
+    'HEADING_5':   5,
+    'HEADING_6':   6,
+    'SUBTITLE':    7,
     'NORMAL_TEXT': 99,
 }
 
@@ -51,20 +61,54 @@ _HEADING_LEVELS = {
 def extract_doc_ids_from_event(event: dict) -> list:
     """Return a list of Google Doc IDs found in the event's Drive attachments."""
     doc_ids = []
-    for attachment in event.get('attachments', []):
+    attachments = event.get('attachments', [])
+    if not isinstance(attachments, list):
+        return doc_ids
+
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
         if attachment.get('mimeType') != _DOC_MIME_TYPE:
             continue
+
         url = attachment.get('fileUrl', '')
+        if not isinstance(url, str) or len(url) > _MAX_URL_LENGTH:
+            logger.warning("Attachment has missing or oversized fileUrl — skipping.")
+            continue
+
         match = _DOC_ID_PATTERN.search(url)
-        if match:
-            doc_ids.append(match.group(1))
+        if not match:
+            continue
+
+        doc_id = match.group(1)
+        if len(doc_id) > _MAX_DOC_ID_LENGTH:
+            logger.warning("Extracted doc ID exceeds maximum length — skipping.")
+            continue
+
+        doc_ids.append(doc_id)
+
     return doc_ids
 
 
 def fetch_doc_content(docs_svc, doc_id: str) -> list:
     """Fetch a Google Doc and return its body content list."""
     doc = docs_svc.documents().get(documentId=doc_id).execute()
-    return doc.get('body', {}).get('content', [])
+
+    if not isinstance(doc, dict):
+        logger.error("Unexpected response type from Docs API for doc '%s'.", doc_id)
+        return []
+
+    body = doc.get('body', {})
+    if not isinstance(body, dict):
+        logger.error("Unexpected 'body' type in Docs API response for doc '%s'.", doc_id)
+        return []
+
+    content = body.get('content', [])
+    if not isinstance(content, list):
+        logger.error("Unexpected 'content' type in Docs API response for doc '%s'.", doc_id)
+        return []
+
+    return content
 
 
 def build_today_date_prefix(today: datetime.date) -> str:
@@ -125,21 +169,30 @@ def has_topics_for_today(content: list, today: datetime.date) -> bool:
     date_prefix = build_today_date_prefix(today)
 
     # 3-state machine: SEARCHING_DATE → SEARCHING_TOPICS → CHECKING_CONTENT
-    STATE_SEARCHING_DATE = 0
-    STATE_SEARCHING_TOPICS = 1
-    STATE_CHECKING_CONTENT = 2
+    STATE_SEARCHING_DATE    = 0
+    STATE_SEARCHING_TOPICS  = 1
+    STATE_CHECKING_CONTENT  = 2
 
     state = STATE_SEARCHING_DATE
     date_heading_level = None
-    topics_heading_level = None
+
+    elements_processed = 0
 
     for element in content:
+        elements_processed += 1
+        if elements_processed > _MAX_CONTENT_ELEMENTS:
+            logger.warning(
+                "Document content element limit (%d) reached — stopping parse.",
+                _MAX_CONTENT_ELEMENTS,
+            )
+            break
+
         if 'paragraph' not in element:
             # Skip sectionBreak, table, etc.
             continue
 
-        para = element['paragraph']
-        text = _get_paragraph_text(para)
+        para  = element['paragraph']
+        text  = _get_paragraph_text(para)
         level = _heading_level(para)
         is_heading = level < 99
 
@@ -147,7 +200,7 @@ def has_topics_for_today(content: list, today: datetime.date) -> bool:
             if is_heading and text.startswith(date_prefix):
                 date_heading_level = level
                 state = STATE_SEARCHING_TOPICS
-                logger.debug("Found today's date heading: '%s' (level %d)", text, level)
+                logger.debug("Found today's date heading (level %d).", level)
 
         elif state == STATE_SEARCHING_TOPICS:
             if is_heading:
@@ -162,9 +215,8 @@ def has_topics_for_today(content: list, today: datetime.date) -> bool:
                     return False
             # Match "Topics", "Topic", "Topics:", "Topic:" case-insensitively.
             if text.lower().rstrip(':') in ('topics', 'topic'):
-                topics_heading_level = level
                 state = STATE_CHECKING_CONTENT
-                logger.debug("Found 'Topics' sub-heading (level %d)", level)
+                logger.debug("Found 'Topics' sub-heading (level %d).", level)
 
         elif state == STATE_CHECKING_CONTENT:
             if is_heading:
@@ -179,11 +231,11 @@ def has_topics_for_today(content: list, today: datetime.date) -> bool:
             # A known end-section name (Notes, Action items, etc.) ends the Topics section
             # regardless of whether it is a heading or normal/bold text.
             if text.lower() in _END_SECTION_NAMES:
-                logger.debug("Left 'Topics' sub-section (end section: '%s').", text)
+                logger.debug("Left 'Topics' sub-section (end section encountered).")
                 return False
             # Any other non-empty text is a topic item.
             if text:
-                logger.debug("Found topic content: '%s'", text[:60])
+                logger.debug("Found topic content.")
                 return True
 
     # Exhausted document without confirming topics.

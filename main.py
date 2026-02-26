@@ -26,6 +26,9 @@ Usage:
 import argparse
 import datetime
 import logging
+import logging.handlers
+import os
+import stat
 import sys
 from zoneinfo import ZoneInfo
 
@@ -33,17 +36,49 @@ import auth
 import calendar_service
 import canceller
 
+LOG_FILE = 'optimizer.log'
+# Rotate at 10 MB, keep 5 backups.
+_LOG_MAX_BYTES = 10 * 1024 * 1024
+_LOG_BACKUP_COUNT = 5
+
 
 def configure_logging() -> None:
     fmt = '%(asctime)s %(levelname)-8s %(name)s: %(message)s'
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=_LOG_MAX_BYTES,
+        backupCount=_LOG_BACKUP_COUNT,
+        encoding='utf-8',
+    )
+    # Restrict log file to owner-read/write after creation.
+    try:
+        os.chmod(LOG_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass  # File may not exist yet on very first run; handler creates it next.
+
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('optimizer.log'),
+            file_handler,
         ],
     )
+
+    # Restrict log file again now that basicConfig/handler has created it.
+    try:
+        os.chmod(LOG_FILE, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def _safe_summary(event: dict) -> str:
+    """Return a sanitised event summary safe to write to logs."""
+    raw = event.get('summary', 'Untitled')
+    # Truncate to 80 chars and use repr() to neutralise any embedded newlines
+    # or control characters that could enable log injection.
+    return repr(raw[:80])
 
 
 def main() -> None:
@@ -85,8 +120,8 @@ def main() -> None:
                     )
                 except Exception:
                     logger.exception(
-                        "Error processing event '%s' — skipping and continuing.",
-                        event.get('summary', 'Untitled'),
+                        "Error processing event %s — skipping and continuing.",
+                        _safe_summary(event),
                     )
 
     except FileNotFoundError as exc:
