@@ -34,7 +34,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch, call, mock_open
 
 import httplib2
 from googleapiclient.errors import HttpError
@@ -43,6 +43,7 @@ import auth
 import calendar_service
 import canceller
 import docs_service
+import main
 from canceller import CANCELLATION_NOTE
 
 
@@ -368,6 +369,105 @@ class TestGetCredentials(unittest.TestCase):
             # Browser flow must have been triggered.
             mock_flow_cls.from_client_secrets_file.assert_called_once()
             self.assertEqual(result, mock_new_creds)
+
+
+# ---------------------------------------------------------------------------
+# UT-14 .. UT-16  run-once-per-day guard (main._read_last_success /
+#                 _write_last_success / early-exit in main())
+# ---------------------------------------------------------------------------
+
+class TestRunOncePerDay(unittest.TestCase):
+
+    def test_ut14_already_ran_today_exits_early(self):
+        """UT-14: last_success.txt contains today → main() exits before fetching events."""
+        today = datetime.date(2026, 2, 27)
+
+        # Fake creds / services so auth doesn't touch the filesystem.
+        mock_creds = MagicMock()
+        mock_cal_svc = MagicMock()
+        mock_docs_svc = MagicMock()
+        mock_cal_svc.settings.return_value.get.return_value.execute.return_value = {
+            'value': 'UTC'
+        }
+
+        with (
+            patch('main._read_last_success', return_value=today),
+            patch('main._write_last_success') as mock_write,
+            patch('auth.get_credentials', return_value=mock_creds),
+            patch('auth.build_services', return_value=(mock_cal_svc, mock_docs_svc, MagicMock())),
+            patch('calendar_service.get_todays_recurring_events') as mock_fetch,
+            patch('sys.argv', ['main.py']),
+        ):
+            with self.assertLogs('main', level='INFO') as log_ctx:
+                main.main()
+
+        # Events must NOT have been fetched.
+        mock_fetch.assert_not_called()
+        # Success file must NOT be overwritten.
+        mock_write.assert_not_called()
+        self.assertTrue(
+            any('already ran successfully today' in msg for msg in log_ctx.output),
+            "Expected early-exit log message",
+        )
+
+    def test_ut15_successful_run_writes_last_success(self):
+        """UT-15: After a successful run, last_success.txt is written with today's date."""
+        mock_creds = MagicMock()
+        mock_cal_svc = MagicMock()
+        mock_docs_svc = MagicMock()
+        mock_cal_svc.settings.return_value.get.return_value.execute.return_value = {
+            'value': 'UTC'
+        }
+        # No recurring events today → nothing to cancel.
+        mock_cal_svc.events.return_value.list.return_value.execute.return_value = {
+            'items': []
+        }
+
+        with (
+            patch('main._read_last_success', return_value=None),
+            patch('main._write_last_success') as mock_write,
+            patch('auth.get_credentials', return_value=mock_creds),
+            patch('auth.build_services', return_value=(mock_cal_svc, mock_docs_svc, MagicMock())),
+            patch('sys.argv', ['main.py']),
+        ):
+            main.main()
+
+        # _write_last_success must have been called with today's date.
+        mock_write.assert_called_once()
+        written_date = mock_write.call_args[0][0]
+        self.assertIsInstance(written_date, datetime.date)
+
+    def test_ut16_past_date_in_file_does_not_exit_early(self):
+        """UT-16: last_success.txt contains yesterday → program proceeds normally."""
+        yesterday = datetime.date(2026, 2, 26)
+
+        mock_creds = MagicMock()
+        mock_cal_svc = MagicMock()
+        mock_docs_svc = MagicMock()
+        mock_cal_svc.settings.return_value.get.return_value.execute.return_value = {
+            'value': 'UTC'
+        }
+        mock_cal_svc.events.return_value.list.return_value.execute.return_value = {
+            'items': []
+        }
+
+        with (
+            patch('main._read_last_success', return_value=yesterday),
+            patch('main._write_last_success') as mock_write,
+            patch('auth.get_credentials', return_value=mock_creds),
+            patch('auth.build_services', return_value=(mock_cal_svc, mock_docs_svc, MagicMock())),
+            patch('calendar_service.get_todays_recurring_events') as mock_fetch,
+            patch('sys.argv', ['main.py']),
+        ):
+            mock_fetch.return_value = []
+            main.main()
+
+        # Events MUST have been fetched (program did not exit early).
+        mock_fetch.assert_called_once()
+        # Success file MUST be written with today's (not yesterday's) date.
+        mock_write.assert_called_once()
+        written_date = mock_write.call_args[0][0]
+        self.assertNotEqual(written_date, yesterday)
 
 
 # ---------------------------------------------------------------------------
